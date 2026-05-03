@@ -69,10 +69,35 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 
 **Step 1 — parse the user input.** Separate the video source (URL or path) from any question the user asked. Example: `/watch https://youtu.be/abc what language is this in?` → source = `https://youtu.be/abc`, question = `what language is this in?`.
 
-**Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting:
+**Step 1.5 — pick the target directory.** The script creates its workdir (`watch-<slug>/`) inside the *current working directory*. To let the user route that workdir into a vault, project folder, or any other prior location they've used, the skill keeps a small recents file at `~/.config/watch/recent-targets.txt` (one absolute path per line, newest first, capped at 5).
+
+Look at it before running:
+
+```bash
+test -s ~/.config/watch/recent-targets.txt && head -5 ~/.config/watch/recent-targets.txt
+```
+
+Decide what to do based on what you find:
+
+- **File missing or empty** → silently use the current working directory. No prompt — first-time and one-off runs shouldn't get interrupted.
+- **User already named a target in their message** (e.g. "save it to `~/notes/videos`", "drop it in the karpathy vault") → use that path; no prompt. Expand `~` to `$HOME`.
+- **Recents exist and the user didn't specify** → call `AskUserQuestion` with the title "Where should this video's workdir go?" and these options, in this order:
+  1. **Current directory** — labeled with the actual `pwd`. This is the default; pick it unless the user picks otherwise.
+  2. One option per entry in the recents file (most recent first), labeled with the path. Skip any entry that equals cwd (don't show duplicates).
+  3. **Custom path…** — when the user picks this, ask them for an absolute path, then expand `~`.
+
+Normalize the final answer to an absolute path. Hand it to Step 2 as `$TARGET`.
+
+**Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting. If `$TARGET` is the current directory, just run the script normally:
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>"
+```
+
+If `$TARGET` is somewhere else, change into it first so the script creates its workdir there. If the source is a *local file* (not a URL), resolve it to an absolute path before the `cd` — otherwise the relative path breaks once cwd changes:
+
+```bash
+cd "$TARGET" && python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source-or-abs-path>"
 ```
 
 Optional flags:
@@ -121,7 +146,19 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
 
-**Step 5 — clean up.** The script prints a working directory at the end. If the user isn't going to ask follow-ups about this video, delete it with `rm -rf <dir>`. If they might, leave it in place.
+**Step 4.5 — record the target for next time.** After the script finishes successfully (and before any cleanup in Step 5), prepend the target to the recents file (deduped, capped at 5). Do this whether the target was cwd or a chosen path — the list builds up naturally and stale entries rotate out:
+
+```bash
+mkdir -p ~/.config/watch
+TARGET="<absolute-target-dir>"
+{ printf '%s\n' "$TARGET"; grep -vxF -- "$TARGET" ~/.config/watch/recent-targets.txt 2>/dev/null; } \
+  | head -5 > ~/.config/watch/recent-targets.txt.tmp \
+  && mv ~/.config/watch/recent-targets.txt.tmp ~/.config/watch/recent-targets.txt
+```
+
+Skip this step if the script failed — only successful runs should seed the list.
+
+**Step 5 — clean up.** The script prints a working directory at the end (inside `$TARGET` from Step 1.5, or cwd if you didn't redirect). If the user isn't going to ask follow-ups about this video, delete it with `rm -rf <dir>`. If they might, leave it in place.
 
 ## Transcription
 
@@ -160,13 +197,14 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads / appends `~/.config/watch/recent-targets.txt` to remember up to 5 recently used target directories (so you can route a new video into a vault folder without retyping the path). Plain text, no secrets, capped at 5 lines
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting)
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
-- Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
+- Does not persist anything outside the working directory, `~/.config/watch/.env`, and `~/.config/watch/recent-targets.txt` — clean up the working directory when you're done (Step 5)
 
 **Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
 
